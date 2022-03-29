@@ -1,4 +1,5 @@
 import uuid
+import time as prgm_time
 from src.utils import *
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -23,32 +24,35 @@ class ReceiveECGs:
         self.rhrn_puid_map = get_rhrn2puid_mapping(self.CIROC_PATIENT_PATH)
 
         self.identified_attr = (pd.read_csv("./src/idtags.txt", header=None)[0]).to_list()
-        self.decoder_DB = SqliteDBWrap("decoder.db")
-        cols = {
+        self.decoder_DB = SqliteDBWrap("./database/decoder.db")
+        decoder_cols = {
             "EUID": "TEXT PRIMARY KEY",
             "PUID": "TEXT",
             "BUID": "TEXT"
         }
         for col_name in self.identified_attr:
-            cols[col_name] = "TEXT"
-        self.decoder_DB.create_table("Decoder", cols)
+            decoder_cols[col_name] = "TEXT"
+        self.decoder_DB.create_table("Decoder", decoder_cols)
 
-        self.unparsable_DB = SqliteDBWrap("unparsable.db")
+        self.waveformfeatures_DB = SqliteDBWrap("./database/waveformfeatures.db")
+        wvfm_features_cols = {
+            "EUID_LEAD": "TEXT PRIMARY KEY",
+            "BUID": "TEXT",
+            "LEAD": "INT",
+            "NOCHANGE20": "INT",
+            "CURVELENGTH": "REAL",
+            "HISTENTROPY": "REAL",
+            "AUTOCORRSIM": "REAL"
+        }
+        self.waveformfeatures_DB.create_table("WaveformFeatures", wvfm_features_cols)
+
+        self.unparsable_DB = SqliteDBWrap("./database/unparsable.db")
         self.unparsable_DB.create_table("Unparsable", {"FILENAME": "TEXT PRIMARY KEY", "BUID": "TEXT"})
 
-        self.samplingfs_DB = SqliteDBWrap("samplingfs.db")
+        self.samplingfs_DB = SqliteDBWrap("./database/samplingfs.db")
         self.samplingfs_DB.create_table("fs", {"EUID": "TEXT PRIMARY KEY", "fs": "INT"})
         return
 
-
-
-    def generate_summary(self, buid):
-        """
-
-        :param buid:
-        :return:
-        """
-        return
 
 
     def receive_batch(self):
@@ -60,6 +64,7 @@ class ReceiveECGs:
         extracted_ident = []
         unparsable = []
         fss = []
+        signal_container = torch.zeros(self.subbatch_size * 8 * 5000, dtype=torch.float32)
 
         for xml in os.listdir(self.xml_dir):
             try:
@@ -88,8 +93,11 @@ class ReceiveECGs:
             # All checks have passed, now permitted to generate a new encounter
             euid = 'g' + str(uuid.uuid4())[:8]
 
-            # Write the waveform
-            writeh5(tree, euid, puid, self.h5_dir)
+            # Write the waveform and place in signal container
+            ecg = writeh5(tree, euid, puid, self.h5_dir)
+            l = subbatch_progress * 8 * 5000
+            r = (subbatch_progress + 1) * 8 * 5000
+            signal_container[l:r] = ecg
 
             # Split the tree to de-identify
             deid_tree, identified_elements = deidentify(tree, self.identified_attr)
@@ -114,6 +122,12 @@ class ReceiveECGs:
                 self.unparsable_DB.batch_write_listlists("Unparsable", unparsable)
                 self.samplingfs_DB.batch_write_listlists("fs", fss)
 
+                start = prgm_time.time()
+                resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, subbatch_progress*8)
+                print(prgm_time.time() - start)
+                start = prgm_time.time()
+                resAC = get_autocorr_sim(signal_container, subbatch_progress*8)
+                print(prgm_time.time() - start)
                 # Empty containers
                 jsons = []
                 unparsable = []
@@ -124,6 +138,9 @@ class ReceiveECGs:
         self.decoder_DB.batch_write_listlists("Decoder", extracted_ident)
         self.unparsable_DB.batch_write_listlists("Unparsable", unparsable)
         self.samplingfs_DB.batch_write_listlists("fs", fss)
+        if subbatch_progress > 0:
+            resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, subbatch_progress)
+
         self.decoder_DB.exit()
         self.unparsable_DB.exit()
         self.samplingfs_DB.exit()
@@ -131,5 +148,5 @@ class ReceiveECGs:
         send_json_to_socket(jsons, self.URL)
 
         write_rhrn2puid_mapping(self.rhrn_puid_map, self.CIROC_PATIENT_PATH)
-        self.generate_summary(buid)
+        generate_summary(buid, self.decoder_DB)
         return

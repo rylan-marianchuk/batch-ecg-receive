@@ -1,17 +1,32 @@
+import math
+
 import pandas as pd
 import json
 import h5py
 import torch
 import base64
 import array
+import ctypes
+from ctypes import *
+import numpy as np
 
 up = torch.nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
+cosSim = torch.nn.CosineSimilarity(dim=0)
 
 def send_json_to_socket(arr, url):
     """
 
     :param arr:
     :param url:
+    :return:
+    """
+    return
+
+
+def generate_summary(buid, sqlwrapper):
+    """
+
+    :param buid:
     :return:
     """
     return
@@ -37,7 +52,7 @@ def writeh5(tree, euid, puid, h5path):
     :param euid: (str) encounter id
     :param puid: (str) patient id
     :param h5path: (str) /path/to/write/h5s/to/
-    :return: None, write the file to disk
+    :return: (tensor) shape=(40,000) one dimensional array of the ecg, each lead appended end to end
     """
     rhythm_wfrm = tree.findall('.//Waveform')[1]
     rhythm_leads = rhythm_wfrm.findall("LeadData")
@@ -59,7 +74,7 @@ def writeh5(tree, euid, puid, h5path):
         ECG_lead_dict[lead_ID] = T
 
     # Create the contiguous tensor, literals acceptable here because this is standard lead and signal length
-    ecg = torch.zeros(5000*8)
+    ecg = torch.zeros(5000*8, dtype=torch.float32)
 
     for i, key in enumerate(("I", "II", "V1", "V2", "V3", "V4", "V5", "V6")):
         ecg[i*5000:(i+1)*5000] = ECG_lead_dict[key]
@@ -67,7 +82,7 @@ def writeh5(tree, euid, puid, h5path):
     h5 = h5py.File(h5path + euid + "_" + puid + ".h5", 'w')
     h5.create_dataset("ECG", data=ecg)
     h5.close()
-    return
+    return ecg
 
 
 def get_rhrn2puid_mapping(CIROC_PATIENT_PATH):
@@ -133,3 +148,70 @@ def getFormattedDateTime(tree):
     # Shift date string to YYYY-MM-DD
     # FORMAT YYYY-MM-DD_HH:MM:SS
     return d.split("-")[-1] + "-" + d[:5] + "_" + t, d, t
+
+
+def invoke_gpu(signal_container, SIGNALS):
+    """
+
+    :param signal_container: (tensor)
+    :return:
+    """
+    dll = ctypes.CDLL("./src/wvfm_features.so", mode=ctypes.RTLD_GLOBAL)
+    get_wvfm_features_gpu = dll.GetWvfmFeaturesGPU
+    get_wvfm_features_gpu.argtypes = [POINTER(c_float), POINTER(c_float), POINTER(c_float), POINTER(c_float), POINTER(c_int), c_size_t]
+
+
+    ecg_container_p = signal_container.numpy().ctypes.data_as(POINTER(c_float))
+    resCL = np.zeros(SIGNALS).astype("float32")
+    resCL_p = resCL.ctypes.data_as(POINTER(c_float))
+
+    resHE = np.zeros(SIGNALS).astype("float32")
+    resHE_p = resHE.ctypes.data_as(POINTER(c_float))
+
+    resAC = np.zeros(SIGNALS).astype("float32")
+    resAC_p = resAC.ctypes.data_as(POINTER(c_float))
+
+    res20flat = np.zeros(SIGNALS).astype("int32")
+    res20flat_p = res20flat.ctypes.data_as(POINTER(c_int32))
+
+    get_wvfm_features_gpu(ecg_container_p, resCL_p, resHE_p, resAC_p, res20flat_p, SIGNALS)
+    return resCL, resHE, resAC, res20flat
+
+
+def get_autocorr_sim(signal_container, SIGNALS):
+    """
+
+    :param signal_container:
+    :param SIGNALS:
+    :return:
+    """
+    seg_size = 1250
+    segs = 4
+    nlags = 50
+    resAC = np.zeros(SIGNALS)
+    for x,start_signal in enumerate(range(0, signal_container.shape[0], 5000)):
+        ACFs = torch.zeros(segs, nlags+1)
+        signal = signal_container[start_signal:start_signal+5000]
+        for i in range(segs):
+            segment = signal[i*seg_size:(i+1)*seg_size]
+            demeaned = segment - segment.mean()
+            Frf = np.fft.fft(demeaned, n=2560)
+            acov = np.fft.ifft(Frf * np.conjugate(Frf))[:seg_size] / (1250 * np.ones(1250))
+            acov = acov.real
+            acf = acov[:nlags+1] / acov[0]
+            ACFs[i] = torch.from_numpy(acf)
+
+        pairwiseM = torch.zeros(4, 4)
+
+        for i, j in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]:
+            A1 = ACFs[i]
+            A2 = ACFs[j]
+            similarity = cosSim(A1, A2)
+            if not (0 <= similarity <= 1):
+                similarity = min(similarity, 1.00)
+            theta = math.acos(similarity)
+            pairwiseM[i, j] = theta
+            pairwiseM[j, i] = theta
+
+        resAC[x] = torch.sum(pairwiseM, dim=1).sum().item()
+    return resAC
