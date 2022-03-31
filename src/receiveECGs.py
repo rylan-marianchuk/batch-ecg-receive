@@ -6,6 +6,7 @@ import pandas as pd
 import os
 from src.sqlite_wrapper import SqliteDBWrap
 
+
 class ReceiveECGs:
 
     def __init__(self, xml_dir, URL, puid_map, h5_dir):
@@ -34,6 +35,7 @@ class ReceiveECGs:
             decoder_cols[col_name] = "TEXT"
         self.decoder_DB.create_table("Decoder", decoder_cols)
 
+        self.sqlite_column_iter = SqliteColumnIter()
         self.waveformfeatures_DB = SqliteDBWrap("./database/waveformfeatures.db")
         wvfm_features_cols = {
             "EUID_LEAD": "TEXT PRIMARY KEY",
@@ -51,6 +53,13 @@ class ReceiveECGs:
 
         self.samplingfs_DB = SqliteDBWrap("./database/samplingfs.db")
         self.samplingfs_DB.create_table("fs", {"EUID": "TEXT PRIMARY KEY", "fs": "INT"})
+
+        self.statement_txt_DB = SqliteDBWrap("./database/statementtxt.db")
+        self.statement_txt_DB.create_table("DiagStatements", {
+            "EUID" : "TEXT PRIMARY KEY",
+            "DIAGNOSIS": "TEXT",
+            "ORIGINALDIAGNOSIS" : "TEXT"
+        })
         return
 
 
@@ -65,6 +74,8 @@ class ReceiveECGs:
         unparsable = []
         fss = []
         signal_container = torch.zeros(self.subbatch_size * 8 * 5000, dtype=torch.float32)
+        lead_euids = []
+        stmt_texts = []
 
         for xml in os.listdir(self.xml_dir):
             try:
@@ -92,12 +103,18 @@ class ReceiveECGs:
 
             # All checks have passed, now permitted to generate a new encounter
             euid = 'g' + str(uuid.uuid4())[:8]
+            lead_euids += [euid+"."+str(lead) for lead in range(8)]
 
             # Write the waveform and place in signal container
             ecg = writeh5(tree, euid, puid, self.h5_dir)
             l = subbatch_progress * 8 * 5000
             r = (subbatch_progress + 1) * 8 * 5000
             signal_container[l:r] = ecg
+
+            # Get the statement texts
+            diagnosis_stmt, orig_diagnosis_stmt = parse_statement_text(tree)
+            stmt_texts.append([euid, diagnosis_stmt, orig_diagnosis_stmt])
+
 
             # Split the tree to de-identify
             deid_tree, identified_elements = deidentify(tree, self.identified_attr)
@@ -117,35 +134,38 @@ class ReceiveECGs:
 
             subbatch_progress += 1
             if subbatch_progress == self.subbatch_size:
-                self.decoder_DB.batch_write_listlists("Decoder", extracted_ident)
-                send_json_to_socket(jsons, self.URL)
-                self.unparsable_DB.batch_write_listlists("Unparsable", unparsable)
-                self.samplingfs_DB.batch_write_listlists("fs", fss)
+                self.unparsable_DB.batch_insert("Unparsable", unparsable)
+                self.decoder_DB.batch_insert("Decoder", extracted_ident)
+                self.samplingfs_DB.batch_insert("fs", fss)
+                self.statement_txt_DB.batch_insert("DiagStatements", stmt_texts)
+                write_lead_features(signal_container, subbatch_progress, lead_euids, buid, self.waveformfeatures_DB)
 
-                start = prgm_time.time()
-                resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, subbatch_progress*8)
-                print(prgm_time.time() - start)
-                start = prgm_time.time()
-                resAC = get_autocorr_sim(signal_container, subbatch_progress*8)
-                print(prgm_time.time() - start)
+                send_json_to_socket(jsons, self.URL)
+
                 # Empty containers
                 jsons = []
                 unparsable = []
                 extracted_ident = []
                 fss = []
+                lead_euids = []
+                stmt_texts = []
                 subbatch_progress = 0
 
-        self.decoder_DB.batch_write_listlists("Decoder", extracted_ident)
-        self.unparsable_DB.batch_write_listlists("Unparsable", unparsable)
-        self.samplingfs_DB.batch_write_listlists("fs", fss)
+
+        self.unparsable_DB.batch_insert("Unparsable", unparsable)
+
         if subbatch_progress > 0:
-            resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, subbatch_progress)
+            self.decoder_DB.batch_insert("Decoder", extracted_ident)
+            self.samplingfs_DB.batch_insert("fs", fss)
+            self.statement_txt_DB.batch_insert("DiagStatements", stmt_texts)
+            write_lead_features(signal_container, subbatch_progress, lead_euids, buid, self.waveformfeatures_DB)
+            send_json_to_socket(jsons, self.URL)
 
         self.decoder_DB.exit()
         self.unparsable_DB.exit()
         self.samplingfs_DB.exit()
-
-        send_json_to_socket(jsons, self.URL)
+        self.waveformfeatures_DB.exit()
+        self.statement_txt_DB.exit()
 
         write_rhrn2puid_mapping(self.rhrn_puid_map, self.CIROC_PATIENT_PATH)
         generate_summary(buid, self.decoder_DB)

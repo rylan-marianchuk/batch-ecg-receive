@@ -1,5 +1,5 @@
 import sqlite3
-
+import numpy as np
 
 class SqliteDBWrap:
 
@@ -8,6 +8,8 @@ class SqliteDBWrap:
 
         :param db_name:
         """
+        sqlite3.register_adapter(np.float32, float)
+        sqlite3.register_adapter(np.int32, int)
         self.db_name = db_name
         self.conx = sqlite3.connect(db_name)
         self.table_entry_headers = {}   # Includes col_name and dtype
@@ -37,14 +39,15 @@ class SqliteDBWrap:
 
 
 
-    def batch_write_listlists(self, tb_name, listlists):
+    def batch_insert(self, tb_name, iterable):
         """
+        Complete a batch insert given a table and iterable object to write from
 
-        :param tb_name:
-        :param listlists:
-        :return:
+        :param tb_name: (str) table name, must exist in DB
+        :param iterable: (iter) where .__next__() returns the next row to insert
+        :return: None
         """
         col_headers = self.table_column_mappings[tb_name].keys()
         n_cols = len(col_headers)
-        self.conx.executemany("INSERT OR IGNORE INTO " + tb_name + "(" + ", ".join(col_headers) + ") VALUES (" + " ,".join(['?'] * n_cols) + ")", listlists)
+        self.conx.executemany("INSERT OR IGNORE INTO " + tb_name + "(" + ", ".join(col_headers) + ") VALUES (" + " ,".join(['?'] * n_cols) + ")", iterable)
         self.conx.commit()

@@ -1,4 +1,5 @@
 import math
+import time
 
 import pandas as pd
 import json
@@ -9,6 +10,7 @@ import array
 import ctypes
 from ctypes import *
 import numpy as np
+from src.sqlite_column_iter import SqliteColumnIter
 
 up = torch.nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
 cosSim = torch.nn.CosineSimilarity(dim=0)
@@ -44,6 +46,41 @@ def is_duplicate(puid, acqDate, acqTime, sqlwrapper):
     if len(res.fetchall()) == 0:
         return False
     return True
+
+def parse_statement_text(tree):
+    """
+
+    :param tree:
+    :return:
+    """
+    diagnosis_xml = tree.find(".//Diagnosis").findall(".//DiagnosisStatement")
+    diagnosis_stmt = ""
+    for e in diagnosis_xml:
+        diagnosis_stmt += e.find(".//StmtText").text + "\n"
+
+    orig_diagnosis_xml = tree.find(".//OriginalDiagnosis").findall(".//DiagnosisStatement")
+    orig_diagnosis_stmt = ""
+    for e in orig_diagnosis_xml:
+        orig_diagnosis_stmt += e.find(".//StmtText").text + "\n"
+
+    return diagnosis_stmt, orig_diagnosis_stmt
+
+
+
+
+
+def write_lead_features(signal_container, subbatch_progress, lead_euids, buid, wvfm_sqlwrapper):
+    """
+
+    :return:
+    """
+    # Signal count
+    s = subbatch_progress*8
+    resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, s)
+    resAC = get_autocorr_sim(signal_container, s)
+    sqlite_column_iter = SqliteColumnIter((lead_euids, [buid]*s, [0, 1, 2, 3, 4, 5, 6, 7]*subbatch_progress, res20flat, resCL, resHE, resAC))
+    wvfm_sqlwrapper.batch_insert("WaveformFeatures", iter(sqlite_column_iter))
+    return
 
 def writeh5(tree, euid, puid, h5path):
     """
@@ -189,9 +226,9 @@ def get_autocorr_sim(signal_container, SIGNALS):
     segs = 4
     nlags = 50
     resAC = np.zeros(SIGNALS)
-    for x,start_signal in enumerate(range(0, signal_container.shape[0], 5000)):
+    for x in range(SIGNALS):
         ACFs = torch.zeros(segs, nlags+1)
-        signal = signal_container[start_signal:start_signal+5000]
+        signal = signal_container[x * 5000: (x+1) * 5000]
         for i in range(segs):
             segment = signal[i*seg_size:(i+1)*seg_size]
             demeaned = segment - segment.mean()
