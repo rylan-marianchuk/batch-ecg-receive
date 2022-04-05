@@ -102,7 +102,7 @@ class ReceiveECGs:
                 continue
 
             # All checks have passed, now permitted to generate a new encounter
-            euid = 'g' + str(uuid.uuid4())[:8]
+            euid = 'g' + str(uuid.uuid4())
             lead_euids += [euid+"."+str(lead) for lead in range(8)]
 
             # Write the waveform and place in signal container
