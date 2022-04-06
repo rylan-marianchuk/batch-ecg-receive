@@ -1,5 +1,21 @@
 import sqlite3
 import numpy as np
+import io
+import zlib
+
+# Numpy array handling taken from http://stackoverflow.com/a/31312102/
+def adapt_array(arr):
+    out = io.BytesIO()
+    np.save(out, arr)
+    out.seek(0)
+    return sqlite3.Binary(zlib.compress(out.read()))
+
+def convert_array(text):
+    out = io.BytesIO(text)
+    out.seek(0)
+    out = io.BytesIO(zlib.decompress(out.read()))
+    return np.load(out)
+
 
 class ColumnIterator:
 
@@ -50,6 +66,10 @@ class SqliteDBWrap:
         """
         sqlite3.register_adapter(np.float32, float)
         sqlite3.register_adapter(np.int32, int)
+        # Converts np.array to TEXT when inserting
+        sqlite3.register_adapter(np.ndarray, adapt_array)
+        # Converts TEXT to np.array when selecting
+        sqlite3.register_converter("NDARRAY", convert_array)
 
         self.db_name = db_name
         self.conx = sqlite3.connect(db_name)

@@ -49,7 +49,7 @@ def is_duplicate(puid, acqDate, acqTime, sqlwrapper):
 
 def parse_statement_text(tree):
     """
-
+    Obtain the physician provided statement text within the xml
     :param tree:
     :return:
     """
@@ -65,6 +65,54 @@ def parse_statement_text(tree):
 
     return diagnosis_stmt, orig_diagnosis_stmt
 
+
+def parse_qrs_measurements(tree):
+    """
+    Obtain all MUSE exported measurements of the ECG within the xml
+    Obtain the generated QRS detection output embedded in the xml
+
+    note return order matters, each return entry is a sqlite column!
+
+    :param tree: (ElementTree) of the ecg xml
+    :return: (ndarray) shape=(heart beats, 2) with row[i] = type, time (as time-th sample),
+             (int) number of QRS complexes,
+             (int) GlobalRR,
+             (int) QTRGGR
+             (float) avgRR
+    """
+
+    qrs = tree.find(".//QRSTimesTypes").findall(".//QRS")
+    qrs_numpy = np.zeros(shape=(len(qrs), 2), dtype=np.short)
+    for i,e in enumerate(qrs):
+        type = int(e.find(".//Type").text)
+        time = int(e.find(".//Time").text)
+        qrs_numpy[i] = np.array([type, time], dtype=np.short)
+    globalRR = int(tree.find(".//QRSTimesTypes").find(".//GlobalRR").text)
+    qtrggr = int(tree.find(".//QRSTimesTypes").find(".//QTRGGR").text)
+    avgRR = np.diff(qrs_numpy[:, 1]).sum() / qrs_numpy.shape[0]
+
+    orig_measurements = tree.find(".//OriginalRestingECGMeasurements")
+
+    ventricular_rate = int(orig_measurements.find(".//VentricularRate").text)
+    atrial_rate = int(orig_measurements.find(".//AtrialRate").text)
+    pr_interval = int(orig_measurements.find(".//PRInterval").text)
+    qrs_duration = int(orig_measurements.find(".//QRSDuration").text)
+
+
+    return qrs_numpy, qrs_numpy.shape[0], globalRR, qtrggr, avgRR
+
+
+def parse_filters(wvfm_tree):
+    """
+
+    :param tree:
+    :return:
+    """
+    fs = int(wvfm.find("SampleBase").text)
+    hpf = int(wvfm.find("HighPassFilter").text)
+    lpf = int(wvfm.find("LowPassFilter").text)
+    ac = int(wvfm.find("ACFilter").text)
+    return fs, hpf, lpf, ac
 
 
 
