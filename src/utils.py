@@ -1,6 +1,4 @@
 import math
-import time
-
 import pandas as pd
 import json
 import h5py
@@ -10,29 +8,10 @@ import array
 import ctypes
 from ctypes import *
 import numpy as np
-from src.sqlite_column_iter import SqliteColumnIter
+from src.sqlite_wrapper import ColumnIterator
 
 up = torch.nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
 cosSim = torch.nn.CosineSimilarity(dim=0)
-
-def send_json_to_socket(arr, url):
-    """
-
-    :param arr:
-    :param url:
-    :return:
-    """
-    return
-
-
-def generate_summary(buid, sqlwrapper):
-    """
-
-    :param buid:
-    :return:
-    """
-    return
-
 
 def is_duplicate(puid, acqDate, acqTime, sqlwrapper):
     """
@@ -46,6 +25,7 @@ def is_duplicate(puid, acqDate, acqTime, sqlwrapper):
     if len(res.fetchall()) == 0:
         return False
     return True
+
 
 def parse_statement_text(tree):
     """
@@ -63,10 +43,24 @@ def parse_statement_text(tree):
     for e in orig_diagnosis_xml:
         orig_diagnosis_stmt += e.find(".//StmtText").text + "\n"
 
-    return diagnosis_stmt, orig_diagnosis_stmt
+    # Extra questions
+    it = tree.find(".//ExtraQuestions")
+    extra_questions = None
+    if it is not None:
+        extra_questions = ""
+        for i,q in enumerate(tree.find(".//ExtraQuestions")):
+            if i > 0: extra_questions += "\n"
+            extra_questions += q[0].text + " : " + str(q[1].text)
+
+    # Reason for test
+    test_elem = tree.find(".//ReasonForTest")
+    reason_for_test = None
+    if test_elem is not None:
+        reason_for_test = test_elem.text
+    return [diagnosis_stmt, orig_diagnosis_stmt, extra_questions, reason_for_test]
 
 
-def parse_qrs_measurements(tree):
+def parse_qrs_measurements(tree, measurement_tags):
     """
     Obtain all MUSE exported measurements of the ECG within the xml
     Obtain the generated QRS detection output embedded in the xml
@@ -74,32 +68,32 @@ def parse_qrs_measurements(tree):
     note return order matters, each return entry is a sqlite column!
 
     :param tree: (ElementTree) of the ecg xml
-    :return: (ndarray) shape=(heart beats, 2) with row[i] = type, time (as time-th sample),
-             (int) number of QRS complexes,
-             (int) GlobalRR,
-             (int) QTRGGR
-             (float) avgRR
+    :param measurement_tags: (list of str) predefined tags to extract
     """
+    # To return
+    row = []
 
-    qrs = tree.find(".//QRSTimesTypes").findall(".//QRS")
-    qrs_numpy = np.zeros(shape=(len(qrs), 2), dtype=np.short)
-    for i,e in enumerate(qrs):
+    qrs = tree.find(".//QRSTimesTypes")
+    qrs_pairs = qrs.findall(".//QRS")
+    qrs_numpy = np.zeros(shape=(len(qrs_pairs), 2), dtype=np.short)
+    for i, e in enumerate(qrs_pairs):
         type = int(e.find(".//Type").text)
         time = int(e.find(".//Time").text)
         qrs_numpy[i] = np.array([type, time], dtype=np.short)
-    globalRR = int(tree.find(".//QRSTimesTypes").find(".//GlobalRR").text)
-    qtrggr = int(tree.find(".//QRSTimesTypes").find(".//QTRGGR").text)
-    avgRR = np.diff(qrs_numpy[:, 1]).sum() / qrs_numpy.shape[0]
 
-    orig_measurements = tree.find(".//OriginalRestingECGMeasurements")
+    GlobalRR = int(qrs.find(".//GlobalRR").text)
+    QTRGGR = int(qrs.find(".//QTRGGR").text)
 
-    ventricular_rate = int(orig_measurements.find(".//VentricularRate").text)
-    atrial_rate = int(orig_measurements.find(".//AtrialRate").text)
-    pr_interval = int(orig_measurements.find(".//PRInterval").text)
-    qrs_duration = int(orig_measurements.find(".//QRSDuration").text)
+    row += [qrs_numpy, GlobalRR, QTRGGR]
 
+    resting_measurements = tree.find(".//RestingECGMeasurements")
 
-    return qrs_numpy, qrs_numpy.shape[0], globalRR, qtrggr, avgRR
+    for tag_name in measurement_tags:
+        e = resting_measurements.find(tag_name)
+        if e is None:
+            row.append(None)
+        else: row.append(int(e.text))
+    return row
 
 
 def parse_filters(wvfm_tree):
@@ -108,16 +102,17 @@ def parse_filters(wvfm_tree):
     :param tree:
     :return:
     """
-    fs = int(wvfm.find("SampleBase").text)
-    hpf = int(wvfm.find("HighPassFilter").text)
-    lpf = int(wvfm.find("LowPassFilter").text)
-    ac = int(wvfm.find("ACFilter").text)
-    return fs, hpf, lpf, ac
+    fs = int(wvfm_tree.find("SampleBase").text)
+    hpf = int(wvfm_tree.find("HighPassFilter").text)
+    lpf = int(wvfm_tree.find("LowPassFilter").text)
+    ac = wvfm_tree.find("ACFilter")
+    if ac is not None:
+        if ac.text == "NONE": ac = None
+        else: ac = int(ac.text)
+    return [fs, lpf, hpf, ac]
 
 
-
-
-def write_lead_features(signal_container, subbatch_progress, lead_euids, buid, wvfm_sqlwrapper):
+def write_lead_features(signal_container, subbatch_progress, lead_euids, buid):
     """
 
     :return:
@@ -126,9 +121,8 @@ def write_lead_features(signal_container, subbatch_progress, lead_euids, buid, w
     s = subbatch_progress*8
     resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, s)
     resAC = get_autocorr_sim(signal_container, s)
-    sqlite_column_iter = SqliteColumnIter((lead_euids, [buid]*s, [0, 1, 2, 3, 4, 5, 6, 7]*subbatch_progress, res20flat, resCL, resHE, resAC))
-    wvfm_sqlwrapper.batch_insert("WaveformFeatures", iter(sqlite_column_iter))
-    return
+    return ColumnIterator((lead_euids, [buid]*s, [0, 1, 2, 3, 4, 5, 6, 7]*subbatch_progress, res20flat, resCL, resHE, resAC))
+
 
 def writeh5(tree, euid, puid, h5path):
     """
@@ -164,7 +158,8 @@ def writeh5(tree, euid, puid, h5path):
     for i, key in enumerate(("I", "II", "V1", "V2", "V3", "V4", "V5", "V6")):
         ecg[i*5000:(i+1)*5000] = ECG_lead_dict[key]
 
-    h5 = h5py.File(h5path + euid + "_" + puid + ".h5", 'w')
+    # Take only the first 9 characters of the EUID
+    h5 = h5py.File(h5path + euid[:9] + "_" + puid + ".h5", 'w')
     h5.create_dataset("ECG", data=ecg)
     h5.close()
     return ecg
@@ -183,24 +178,6 @@ def write_rhrn2puid_mapping(mapping, CIROC_PATIENT_PATH):
     return
 
 
-def get_json_str(euid, puid, acquisitionDate, xml_str):
-    """
-
-    :param euid:
-    :param puid:
-    :param acquisitionDate:
-    :param xml_str:
-    :return:
-    """
-    json_str = json.dumps({
-        "EUID" : euid,
-        "PUID" : puid,
-        "AcquisitionDate": acquisitionDate,
-        "XML" : xml_str
-    })
-    return json_str
-
-
 def deidentify(tree, identified_attr):
     """
 
@@ -212,7 +189,7 @@ def deidentify(tree, identified_attr):
     for attribute in identified_attr:
         found = tree.find(".//" + attribute)
         if found is None:
-            identified_elements.append("NULL")
+            identified_elements.append(None)
             continue
         identified_elements.append(found.text)
         found.text = ' '

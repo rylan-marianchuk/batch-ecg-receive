@@ -1,5 +1,4 @@
 import uuid
-import time as prgm_time
 from src.utils import *
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -21,23 +20,26 @@ class ReceiveECGs:
         self.URL = URL
         self.h5_dir = h5_dir
 
-        self.subbatch_size = 3000
+        self.subbatch_size = 5000
         self.rhrn_puid_map = get_rhrn2puid_mapping(self.CIROC_PATIENT_PATH)
 
-        self.identified_attr = (pd.read_csv("./src/idtags.txt", header=None)[0]).to_list()
+        # CREATING AND OR UPDATING 5 DATABASES -- single table per database for now!!
+
+        # -----  1 decoder.db - holding all identified information
+        self.id_tags = (pd.read_csv("./src/id-tags.txt", header=None)[0]).to_list()
         self.decoder_DB = SqliteDBWrap("./database/decoder.db")
         decoder_cols = {
             "EUID": "TEXT PRIMARY KEY",
             "PUID": "TEXT",
             "BUID": "TEXT"
         }
-        for col_name in self.identified_attr:
+        for col_name in self.id_tags:
             decoder_cols[col_name] = "TEXT"
-        self.decoder_DB.create_table("Decoder", decoder_cols)
+        self.decoder_DB.create_table("decoder", decoder_cols)
 
-        self.sqlite_column_iter = SqliteColumnIter()
-        self.waveformfeatures_DB = SqliteDBWrap("./database/waveformfeatures.db")
-        wvfm_features_cols = {
+        # -----  2 computedFeatures.db - holding extracted features from the signals for quality detection
+        self.computed_features_DB = SqliteDBWrap("./database/computedFeatures.db")
+        computed_features_cols = {
             "EUID_LEAD": "TEXT PRIMARY KEY",
             "BUID": "TEXT",
             "LEAD": "INT",
@@ -46,36 +48,60 @@ class ReceiveECGs:
             "HISTENTROPY": "REAL",
             "AUTOCORRSIM": "REAL"
         }
-        self.waveformfeatures_DB.create_table("WaveformFeatures", wvfm_features_cols)
+        self.computed_features_DB.create_table("computedFeatures", computed_features_cols)
 
+        # -----  3 unparsable.db - write those xml filenames that could not be parsed
         self.unparsable_DB = SqliteDBWrap("./database/unparsable.db")
-        self.unparsable_DB.create_table("Unparsable", {"FILENAME": "TEXT PRIMARY KEY", "BUID": "TEXT"})
+        self.unparsable_DB.create_table("unparsable", {"FILENAME": "TEXT PRIMARY KEY", "BUID": "TEXT"})
 
-        self.samplingfs_DB = SqliteDBWrap("./database/samplingfs.db")
-        self.samplingfs_DB.create_table("fs", {"EUID": "TEXT PRIMARY KEY", "fs": "INT"})
+        # -----  4 waveformMeasurements.db - MUSE writes values pertaining to the signal within the xml, extract these
+        self.measurement_tags = (pd.read_csv("./src/measurement-tags.txt", header=None)[0]).to_list()
+        self.wvfm_measurements_DB = SqliteDBWrap("./database/waveformMeasurements.db")
+        wvfm_measurements_cols = {
+            "EUID": "TEXT PRIMARY KEY",
+            "BUID": "TEXT",
+            "AcquisitionDate": "TEXT",
+            "fs": "INT",
+            "LOWPASS": "INT",
+            "HIGHPASS": "INT",
+            "AC": "INT",
+            "QRSNUMPY": "NDARRAY",
+            "GlobalRR": "INT",
+            "QTRGGR": "INT",
+        }
+        for col_name in self.measurement_tags:
+            wvfm_measurements_cols[col_name] = "INT"
+        self.wvfm_measurements_DB.create_table("waveformMeasurements", wvfm_measurements_cols)
 
-        self.statement_txt_DB = SqliteDBWrap("./database/statementtxt.db")
-        self.statement_txt_DB.create_table("DiagStatements", {
-            "EUID" : "TEXT PRIMARY KEY",
+        # -----  5 diagnosisStatements.db - Extract all physician written comments, statements, and test reasons
+        self.statement_txt_DB = SqliteDBWrap("./database/diagnosisStatements.db")
+        self.statement_txt_DB.create_table("diagnosisStatements", {
+            "EUID": "TEXT PRIMARY KEY",
+            "PUID": "TEXT",
+            "BUID": "TEXT",
             "DIAGNOSIS": "TEXT",
-            "ORIGINALDIAGNOSIS" : "TEXT"
+            "ORIGINALDIAGNOSIS": "TEXT",
+            "EXTRAQUESTIONS": "TEXT",
+            "TESTREASON": "TEXT"
         })
         return
 
 
 
     def receive_batch(self):
+        """
+
+        :return:
+        """
         buid = 'b' + str(uuid.uuid4())[:8]
 
         subbatch_progress = 0
-
-        jsons = []
-        extracted_ident = []
+        decoder = []
         unparsable = []
-        fss = []
         signal_container = torch.zeros(self.subbatch_size * 8 * 5000, dtype=torch.float32)
         lead_euids = []
-        stmt_texts = []
+        statement_txt = []
+        wvfm_measurements = []
 
         for xml in os.listdir(self.xml_dir):
             try:
@@ -112,14 +138,14 @@ class ReceiveECGs:
             signal_container[l:r] = ecg
 
             # Get the statement texts
-            diagnosis_stmt, orig_diagnosis_stmt = parse_statement_text(tree)
-            stmt_texts.append([euid, diagnosis_stmt, orig_diagnosis_stmt])
+            statement_txt.append([euid, puid, buid] + parse_statement_text(tree))
 
+            # QRS Measures
+            wvfm_measurements.append([euid, buid, date] + parse_filters(wvfm) + parse_qrs_measurements(tree, self.measurement_tags))
 
             # Split the tree to de-identify
-            deid_tree, identified_elements = deidentify(tree, self.identified_attr)
-            extracted_ident.append([euid, puid, buid] + identified_elements)
-            fss.append([euid, fs])
+            deid_tree, identified_elements = deidentify(tree, self.id_tags)
+            decoder.append([euid, puid, buid] + identified_elements)
 
 
             # Embed the UID keys for future reference
@@ -130,43 +156,42 @@ class ReceiveECGs:
 
             # Send json to socket
             xml_string = ET.tostring(deid_tree.getroot()).decode()
-            jsons.append(get_json_str(euid, puid, date_time_reformat, xml_string))
+
 
             subbatch_progress += 1
             if subbatch_progress == self.subbatch_size:
-                self.unparsable_DB.batch_insert("Unparsable", unparsable)
-                self.decoder_DB.batch_insert("Decoder", extracted_ident)
-                self.samplingfs_DB.batch_insert("fs", fss)
-                self.statement_txt_DB.batch_insert("DiagStatements", stmt_texts)
-                write_lead_features(signal_container, subbatch_progress, lead_euids, buid, self.waveformfeatures_DB)
-
-                send_json_to_socket(jsons, self.URL)
+                self.decoder_DB.batch_insert(decoder)
+                computed_cols = write_lead_features(signal_container, subbatch_progress, lead_euids, buid)
+                self.computed_features_DB.batch_insert(iter(computed_cols))
+                self.unparsable_DB.batch_insert(unparsable)
+                self.wvfm_measurements_DB.batch_insert(wvfm_measurements)
+                self.statement_txt_DB.batch_insert(statement_txt)
 
                 # Empty containers
                 jsons = []
                 unparsable = []
-                extracted_ident = []
-                fss = []
+                decoder = []
+                wvfm_measurements = []
                 lead_euids = []
-                stmt_texts = []
+                statement_txt = []
                 subbatch_progress = 0
+                print("Finished batch of " + str(self.subbatch_size))
 
 
-        self.unparsable_DB.batch_insert("Unparsable", unparsable)
+        self.unparsable_DB.batch_insert(unparsable)
 
         if subbatch_progress > 0:
-            self.decoder_DB.batch_insert("Decoder", extracted_ident)
-            self.samplingfs_DB.batch_insert("fs", fss)
-            self.statement_txt_DB.batch_insert("DiagStatements", stmt_texts)
-            write_lead_features(signal_container, subbatch_progress, lead_euids, buid, self.waveformfeatures_DB)
-            send_json_to_socket(jsons, self.URL)
+            self.decoder_DB.batch_insert(decoder)
+            computed_cols = write_lead_features(signal_container, subbatch_progress, lead_euids, buid)
+            self.computed_features_DB.batch_insert(iter(computed_cols))
+            self.wvfm_measurements_DB.batch_insert(wvfm_measurements)
+            self.statement_txt_DB.batch_insert(statement_txt)
 
         self.decoder_DB.exit()
+        self.computed_features_DB.exit()
         self.unparsable_DB.exit()
-        self.samplingfs_DB.exit()
-        self.waveformfeatures_DB.exit()
+        self.wvfm_measurements_DB.exit()
         self.statement_txt_DB.exit()
 
         write_rhrn2puid_mapping(self.rhrn_puid_map, self.CIROC_PATIENT_PATH)
-        generate_summary(buid, self.decoder_DB)
         return

@@ -131,7 +131,7 @@ class SqliteDBWrap:
         """
         if tb_name is None:
             # Default to first table inserted
-            tb_name = self.table_column_mappings.keys()[0]
+            tb_name = list(self.table_column_mappings.keys())[0]
 
         col_headers = self.table_column_mappings[tb_name].keys()
         n_cols = len(col_headers)
@@ -148,7 +148,7 @@ class SqliteDBWrap:
         """
         if tb_name is None:
             # Default to first table inserted
-            tb_name = self.table_column_mappings.keys()[0]
+            tb_name = list(self.table_column_mappings.keys())[0]
 
         res = self.conx.execute("SELECT COUNT(*) FROM " + tb_name)
         return res.fetchall()[0][0]
@@ -165,12 +165,12 @@ class SqliteDBWrap:
         """
         if tb_name is None:
             # Default to first table inserted
-            tb_name = self.table_column_mappings.keys()[0]
+            tb_name = list(self.table_column_mappings.keys())[0]
 
         # Primary key name
         pk_name = self.table_column_mappings[tb_name].keys()[0]
 
-        query_size = len(primary_keys)
+        q_size = len(primary_keys)
         sql = "SELECT"
         if specify_cols is None:
             sql += " * "
