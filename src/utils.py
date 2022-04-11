@@ -1,6 +1,5 @@
 import math
 import pandas as pd
-import json
 import h5py
 import torch
 import base64
@@ -8,7 +7,7 @@ import array
 import ctypes
 from ctypes import *
 import numpy as np
-from src.sqlite_wrapper import ColumnIterator
+from sqlite_wrapper import ColumnIterator
 
 up = torch.nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
 cosSim = torch.nn.CosineSimilarity(dim=0)
@@ -121,28 +120,40 @@ def write_lead_features(signal_container, subbatch_progress, lead_euids, buid):
     s = subbatch_progress*8
     resCL, resHE, resAC, res20flat = invoke_gpu(signal_container, s)
     resAC = get_autocorr_sim(signal_container, s)
-    return ColumnIterator((lead_euids, [buid]*s, [0, 1, 2, 3, 4, 5, 6, 7]*subbatch_progress, res20flat, resCL, resHE, resAC))
+    resBaselinePower = get_baseline_power_r(signal_container, s)
+    return ColumnIterator((lead_euids, [buid]*s, [0, 1, 2, 3, 4, 5, 6, 7]*subbatch_progress, res20flat, resCL, resHE, resAC, resBaselinePower))
 
 
-def writeh5(tree, euid, puid, h5path):
+def writeh5(tree, euid, h5path, median=False):
     """
     Decode the waveforms in the xml, upsample if needed, save them in a contiguous tensor to h5
     :param tree: (ElementTree) of the ecg xml
     :param euid: (str) encounter id
-    :param puid: (str) patient id
     :param h5path: (str) /path/to/write/h5s/to/
+    :param median: (bool) whether to decode the median or rhythm waveforms
     :return: (tensor) shape=(40,000) one dimensional array of the ecg, each lead appended end to end
     """
-    rhythm_wfrm = tree.findall('.//Waveform')[1]
-    rhythm_leads = rhythm_wfrm.findall("LeadData")
+    name = h5path
+    # Major assumption in xml: Rhythm waveform will always exist after the median
+    if median:
+        wvfms = tree.findall('.//Waveform')[0]
+        shape = 600
+        name += "median/"
+    else:
+        wvfms = tree.findall('.//Waveform')[1]
+        shape = 5000
+        name += "rhythm/"
+    name += euid
+
+    leads = wvfms.findall("LeadData")
     # Sampling frequency
-    fs = int(rhythm_wfrm.find("SampleBase").text)
+    fs = int(wvfms.find("SampleBase").text)
 
     ECG_lead_dict = {}
 
     # Assume xml always has 8 leads
     for lead_ind in range(8):
-        lead_xml = rhythm_leads[lead_ind]
+        lead_xml = leads[lead_ind]
         encodedStr = lead_xml.find("WaveFormData").text
         lead_ID = lead_xml.find("LeadID").text
         to_decode = base64.b64decode(encodedStr)
@@ -153,13 +164,13 @@ def writeh5(tree, euid, puid, h5path):
         ECG_lead_dict[lead_ID] = T
 
     # Create the contiguous tensor, literals acceptable here because this is standard lead and signal length
-    ecg = torch.zeros(5000*8, dtype=torch.float32)
+    ecg = torch.zeros(shape*8, dtype=torch.float32)
 
     for i, key in enumerate(("I", "II", "V1", "V2", "V3", "V4", "V5", "V6")):
-        ecg[i*5000:(i+1)*5000] = ECG_lead_dict[key]
+        ecg[i*shape:(i+1)*shape] = ECG_lead_dict[key]
 
     # Take only the first 9 characters of the EUID
-    h5 = h5py.File(h5path + euid[:9] + "_" + puid + ".h5", 'w')
+    h5 = h5py.File(name, 'w')
     h5.create_dataset("ECG", data=ecg)
     h5.close()
     return ecg
@@ -277,3 +288,17 @@ def get_autocorr_sim(signal_container, SIGNALS):
 
         resAC[x] = torch.sum(pairwiseM, dim=1).sum().item()
     return resAC
+
+def get_baseline_power_r(signal_container, SIGNALS):
+    """
+
+    :param signal_container:
+    :param SIGNALS:
+    :return:
+    """
+    resBaselinePower = np.zeros(SIGNALS)
+    for x in range(SIGNALS):
+        signal = signal_container[x * 5000: (x+1) * 5000]
+        trfm = torch.pow(torch.abs(torch.fft.rfft(signal)), 2)
+        resBaselinePower[x] = 1 - trfm[:10].sum() / trfm[:400].sum()
+    return resBaselinePower

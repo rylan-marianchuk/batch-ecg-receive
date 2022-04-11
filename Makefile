@@ -4,4 +4,3 @@ all:
 clean:
 	rm ./src/wvfm_features.so
 	rm ./database/*.db
-	rm /home/rylan/ecgh5/*

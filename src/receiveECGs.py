@@ -3,21 +3,22 @@ from src.utils import *
 import xml.etree.ElementTree as ET
 import pandas as pd
 import os
-from src.sqlite_wrapper import SqliteDBWrap
-
+from sqlite_wrapper import SqliteDBWrap
+from xml.dom import minidom
 
 class ReceiveECGs:
 
-    def __init__(self, xml_dir, URL, puid_map, h5_dir):
+    def __init__(self, xml_dir, deid_xml_dir, puid_map, h5_dir):
         """
 
-        :param iter:
-        :param URL:
-        :param puid_map:
+        :param xml_dir: (dir str)
+        :param deid_xml_dir: (dir str)
+        :param puid_map: (path str)
+        :param h5_dir: (dir str)
         """
         self.xml_dir = xml_dir
         self.CIROC_PATIENT_PATH = puid_map
-        self.URL = URL
+        self.deid_xml_dir = deid_xml_dir
         self.h5_dir = h5_dir
 
         self.subbatch_size = 5000
@@ -27,18 +28,19 @@ class ReceiveECGs:
 
         # -----  1 decoder.db - holding all identified information
         self.id_tags = (pd.read_csv("./src/id-tags.txt", header=None)[0]).to_list()
-        self.decoder_DB = SqliteDBWrap("./database/decoder.db")
+        self.decoder_DB = SqliteDBWrap(os.getenv("ECG_DB_PATH") + "decoder.db")
         decoder_cols = {
             "EUID": "TEXT PRIMARY KEY",
             "PUID": "TEXT",
-            "BUID": "TEXT"
+            "BUID": "TEXT",
+            "IDENTIFIED_XML": "TEXT",
         }
         for col_name in self.id_tags:
             decoder_cols[col_name] = "TEXT"
         self.decoder_DB.create_table("decoder", decoder_cols)
 
         # -----  2 computedFeatures.db - holding extracted features from the signals for quality detection
-        self.computed_features_DB = SqliteDBWrap("./database/computedFeatures.db")
+        self.computed_features_DB = SqliteDBWrap(os.getenv("ECG_DB_PATH") + "computedFeatures.db")
         computed_features_cols = {
             "EUID_LEAD": "TEXT PRIMARY KEY",
             "BUID": "TEXT",
@@ -46,17 +48,18 @@ class ReceiveECGs:
             "NOCHANGE20": "INT",
             "CURVELENGTH": "REAL",
             "HISTENTROPY": "REAL",
-            "AUTOCORRSIM": "REAL"
+            "AUTOCORRSIM": "REAL",
+            "BASELINEPOW": "REAL"
         }
         self.computed_features_DB.create_table("computedFeatures", computed_features_cols)
 
         # -----  3 unparsable.db - write those xml filenames that could not be parsed
-        self.unparsable_DB = SqliteDBWrap("./database/unparsable.db")
+        self.unparsable_DB = SqliteDBWrap(os.getenv("ECG_DB_PATH") + "unparsable.db")
         self.unparsable_DB.create_table("unparsable", {"FILENAME": "TEXT PRIMARY KEY", "BUID": "TEXT"})
 
         # -----  4 waveformMeasurements.db - MUSE writes values pertaining to the signal within the xml, extract these
         self.measurement_tags = (pd.read_csv("./src/measurement-tags.txt", header=None)[0]).to_list()
-        self.wvfm_measurements_DB = SqliteDBWrap("./database/waveformMeasurements.db")
+        self.wvfm_measurements_DB = SqliteDBWrap(os.getenv("ECG_DB_PATH") + "waveformMeasurements.db")
         wvfm_measurements_cols = {
             "EUID": "TEXT PRIMARY KEY",
             "BUID": "TEXT",
@@ -74,7 +77,7 @@ class ReceiveECGs:
         self.wvfm_measurements_DB.create_table("waveformMeasurements", wvfm_measurements_cols)
 
         # -----  5 diagnosisStatements.db - Extract all physician written comments, statements, and test reasons
-        self.statement_txt_DB = SqliteDBWrap("./database/diagnosisStatements.db")
+        self.statement_txt_DB = SqliteDBWrap(os.getenv("ECG_DB_PATH") + "diagnosisStatements.db")
         self.statement_txt_DB.create_table("diagnosisStatements", {
             "EUID": "TEXT PRIMARY KEY",
             "PUID": "TEXT",
@@ -132,10 +135,11 @@ class ReceiveECGs:
             lead_euids += [euid+"."+str(lead) for lead in range(8)]
 
             # Write the waveform and place in signal container
-            ecg = writeh5(tree, euid, puid, self.h5_dir)
+            median_ecg = writeh5(tree, euid, self.h5_dir, median=True)
+            rhythm_ecg = writeh5(tree, euid, self.h5_dir, median=False)
             l = subbatch_progress * 8 * 5000
             r = (subbatch_progress + 1) * 8 * 5000
-            signal_container[l:r] = ecg
+            signal_container[l:r] = rhythm_ecg
 
             # Get the statement texts
             statement_txt.append([euid, puid, buid] + parse_statement_text(tree))
@@ -145,18 +149,21 @@ class ReceiveECGs:
 
             # Split the tree to de-identify
             deid_tree, identified_elements = deidentify(tree, self.id_tags)
-            decoder.append([euid, puid, buid] + identified_elements)
+            decoder.append([euid, puid, buid, xml] + identified_elements)
 
 
             # Embed the UID keys for future reference
-            tree.find('.//PatientID').text = puid
-            tree.find('.//PatientLastName').text = puid
-            tree.find('.//DateofBirth').text = buid
-            tree.find('.//PatientFirstName').text = euid
+            deid_tree.find('.//PatientID').text = puid
+            deid_tree.find('.//PatientLastName').text = puid
+            deid_tree.find('.//DateofBirth').text = buid
+            deid_tree.find('.//PatientFirstName').text = euid
 
-            # Send json to socket
-            xml_string = ET.tostring(deid_tree.getroot()).decode()
-
+            # Save the deidentified XML
+            #xml_string = ET.tostring(deid_tree.getroot()).decode()
+            xmlstr = minidom.parseString(ET.tostring(deid_tree.getroot())).toprettyxml(indent="   ")
+            with open(self.deid_xml_dir + euid + ".xml", "w") as f:
+                f.write(xmlstr)
+                f.close()
 
             subbatch_progress += 1
             if subbatch_progress == self.subbatch_size:
